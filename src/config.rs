@@ -12,6 +12,8 @@ pub struct Config {
     pub vibration: Option<bool>,
     /// Override automatic BGPIC selection for connected devices.
     pub bgpic: Option<bool>,
+    /// Accept raw 800x128 strip frames on a per-device Unix socket.
+    pub strip_raw: bool,
     pub leds: LedConfig,
 }
 

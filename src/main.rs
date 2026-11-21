@@ -25,6 +25,8 @@ mod inputs;
 mod led_config;
 mod managed_device;
 mod mappings;
+#[cfg(unix)]
+mod raw_socket;
 mod watcher;
 
 pub static DEVICES: LazyLock<RwLock<HashMap<String, Arc<ManagedDevice>>>> =

@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
+use image::RgbImage;
 use mirajazz::{device::Device, error::MirajazzError, state::DeviceStateReader};
 use openaction::global_events::SetImageEvent;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::device::{StripCanvas, handle_set_image};
+use crate::device::{StripCanvas, StripSink, handle_set_image};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PowerState {
@@ -35,15 +36,26 @@ impl<D> ManagedDevice<D> {
         &self,
         operation: impl for<'a> AsyncFnOnce(&'a D) -> Result<(), MirajazzError>,
     ) -> Result<(), MirajazzError> {
+        self.run_if_awake(operation).await.map(|_| ())
+    }
+
+    /// Like `with_awake_device`, but reports whether the operation ran:
+    /// `Ok(false)` means the device was asleep or cancelled.
+    pub async fn run_if_awake(
+        &self,
+        operation: impl for<'a> AsyncFnOnce(&'a D) -> Result<(), MirajazzError>,
+    ) -> Result<bool, MirajazzError> {
         tokio::select! {
             biased;
-            _ = self.cancel.cancelled() => Ok(()),
+            _ = self.cancel.cancelled() => Ok(false),
             result = async {
                 let power = self.power.lock().await;
                 if *power == PowerState::Awake {
                     operation(&self.device).await?;
+                    Ok(true)
+                } else {
+                    Ok(false)
                 }
-                Ok(())
             } => result,
         }
     }
@@ -73,6 +85,48 @@ impl<D> ManagedDevice<D> {
         }
         self.cancel.cancel();
         false
+    }
+}
+
+/// Why a raw strip operation did not complete.
+#[derive(Debug)]
+pub enum RawError {
+    /// This device has no full-width strip transport.
+    NoStrip,
+    /// The device is asleep or shutting down.
+    NotAwake,
+    Write(MirajazzError),
+}
+
+impl<D: StripSink> ManagedDevice<D> {
+    /// Shows a raw frame. `stale` is checked once the device lock is held; a
+    /// stale frame is dropped silently because a newer one is waiting.
+    pub async fn raw_frame(
+        &self,
+        image: RgbImage,
+        stale: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), RawError> {
+        let strip = self.strip.as_ref().ok_or(RawError::NoStrip)?;
+        let ran = self
+            .run_if_awake(async |device| {
+                if stale() {
+                    return Ok(());
+                }
+                strip.set_raw(device, image).await
+            })
+            .await
+            .map_err(RawError::Write)?;
+        ran.then_some(()).ok_or(RawError::NotAwake)
+    }
+
+    /// Leaves raw mode, returning the strip to the composed view.
+    pub async fn raw_clear(&self) -> Result<(), RawError> {
+        let strip = self.strip.as_ref().ok_or(RawError::NoStrip)?;
+        let ran = self
+            .run_if_awake(async |device| strip.clear_raw(device).await)
+            .await
+            .map_err(RawError::Write)?;
+        ran.then_some(()).ok_or(RawError::NotAwake)
     }
 }
 
@@ -110,6 +164,8 @@ impl ManagedDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device::test_sink::RecordingSink;
+    use crate::mappings::FullStrip;
     use futures_lite::future::poll_once;
     use std::pin::pin;
     use tokio::sync::oneshot;
@@ -168,5 +224,81 @@ mod tests {
             *device.device.lock().await,
             ["keepalive started", "keepalive finished", "sleep"]
         );
+    }
+
+    fn raw_device(sleeping: bool) -> ManagedDevice<RecordingSink> {
+        let device = ManagedDevice::new(
+            RecordingSink::default(),
+            CancellationToken::new(),
+            Some(StripCanvas::new(FullStrip::ImageSlot(3))),
+        );
+        if sleeping {
+            *device.power.try_lock().unwrap() = PowerState::Sleeping;
+        }
+        device
+    }
+
+    fn frame() -> RgbImage {
+        RgbImage::from_pixel(800, 128, image::Rgb([1, 2, 3]))
+    }
+
+    #[tokio::test]
+    async fn raw_frame_is_written_and_clear_restores_the_composed_view() {
+        let device = raw_device(false);
+        device.raw_frame(frame(), &|| false).await.unwrap();
+        assert_eq!(device.device.count(), 1);
+        assert_eq!(device.device.last(), frame());
+
+        device.raw_clear().await.unwrap();
+        assert_eq!(device.device.count(), 2);
+        device.raw_clear().await.unwrap();
+        assert_eq!(device.device.count(), 2, "second clear changes nothing");
+    }
+
+    #[tokio::test]
+    async fn stale_raw_frames_are_dropped_without_a_write() {
+        let device = raw_device(false);
+        device.raw_frame(frame(), &|| true).await.unwrap();
+        assert_eq!(device.device.count(), 0);
+        assert!(!device.strip.as_ref().unwrap().is_raw());
+    }
+
+    #[tokio::test]
+    async fn raw_frames_are_refused_while_asleep() {
+        let device = raw_device(true);
+        assert!(matches!(
+            device.raw_frame(frame(), &|| false).await,
+            Err(RawError::NotAwake)
+        ));
+        assert!(matches!(device.raw_clear().await, Err(RawError::NotAwake)));
+        assert_eq!(device.device.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn raw_frames_need_a_full_strip() {
+        let device = ManagedDevice::new(RecordingSink::default(), CancellationToken::new(), None);
+        assert!(matches!(
+            device.raw_frame(frame(), &|| false).await,
+            Err(RawError::NoStrip)
+        ));
+    }
+
+    #[tokio::test]
+    async fn raw_write_errors_are_reported_and_keep_the_device_usable() {
+        let device = raw_device(false);
+        device
+            .device
+            .fail
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(
+            device.raw_frame(frame(), &|| false).await,
+            Err(RawError::Write(_))
+        ));
+        device
+            .device
+            .fail
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        device.raw_frame(frame(), &|| false).await.unwrap();
+        assert_eq!(device.device.count(), 1);
     }
 }

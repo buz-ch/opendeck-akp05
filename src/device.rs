@@ -1,5 +1,8 @@
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -54,6 +57,13 @@ pub async fn device_task(candidate: CandidateDevice, token: CancellationToken) {
         }
 
         let strip = full_strip.map(StripCanvas::new);
+        if cfg.strip_raw && full_strip.is_none() {
+            log::warn!(
+                "strip_raw is enabled but {} has no full-width strip transport; raw mode is unavailable",
+                candidate.id
+            );
+        }
+        let raw_strip = full_strip.filter(|_| cfg.strip_raw);
         device.set_brightness(50).await?;
         clear_display(&device, strip.as_ref()).await?;
 
@@ -75,14 +85,14 @@ pub async fn device_task(candidate: CandidateDevice, token: CancellationToken) {
             }
         }
 
-        Ok((device, strip))
+        Ok((device, strip, raw_strip))
     };
     let device: Result<_, MirajazzError> = tokio::select! {
         biased;
         _ = token.cancelled() => return,
         result = initialize => result,
     };
-    let (device, strip) = match device {
+    let (device, strip, raw_strip) = match device {
         Ok(device) => device,
         Err(err) => {
             log::error!("Device {} initialization failed: {err}", candidate.id);
@@ -107,6 +117,7 @@ pub async fn device_task(candidate: CandidateDevice, token: CancellationToken) {
             tokio::select! {
                 _ = device_events_task(&candidate, &device) => {},
                 _ = keepalive_task(&candidate, &device) => {},
+                _ = raw_socket_task(&candidate, &device, raw_strip) => {},
             }
         } => {},
     };
@@ -122,6 +133,37 @@ pub async fn device_task(candidate: CandidateDevice, token: CancellationToken) {
     }
 
     log::info!("Device task finished for {:?}", candidate);
+}
+
+/// Serves the raw strip socket for as long as the device runs. Never returns:
+/// a failure to serve leaves the device running without raw mode.
+#[cfg(unix)]
+async fn raw_socket_task(
+    candidate: &CandidateDevice,
+    device: &Arc<ManagedDevice>,
+    raw_strip: Option<FullStrip>,
+) {
+    if let Some(transport) = raw_strip
+        && let Err(err) = crate::raw_socket::serve(&candidate.id, transport, device.clone()).await
+    {
+        log::warn!("Raw strip socket for {} unavailable: {err}", candidate.id);
+    }
+    std::future::pending::<()>().await;
+}
+
+#[cfg(not(unix))]
+async fn raw_socket_task(
+    candidate: &CandidateDevice,
+    _device: &Arc<ManagedDevice>,
+    raw_strip: Option<FullStrip>,
+) {
+    if raw_strip.is_some() {
+        log::warn!(
+            "strip_raw is only supported on Unix; raw mode unavailable for {}",
+            candidate.id
+        );
+    }
+    std::future::pending::<()>().await;
 }
 
 pub async fn connect(candidate: &CandidateDevice) -> Result<Device, MirajazzError> {
@@ -321,19 +363,59 @@ pub async fn handle_set_image(
     Ok(())
 }
 
+/// Where the finished 800x128 strip picture is written.
+pub trait StripSink: Send + Sync {
+    fn write_strip(
+        &self,
+        mode: FullStrip,
+        image: DynamicImage,
+    ) -> impl Future<Output = Result<(), MirajazzError>> + Send;
+}
+
+impl StripSink for Device {
+    async fn write_strip(&self, mode: FullStrip, image: DynamicImage) -> Result<(), MirajazzError> {
+        match mode {
+            FullStrip::ImageSlot(index) => {
+                self.set_button_image(index, FULL_STRIP_FORMAT, image)
+                    .await?;
+                self.flush().await
+            }
+            FullStrip::Bgpic => send_strip_bgpic(self, image).await,
+        }
+    }
+}
+
 /// One continuous strip canvas per connection, with a quarter for each dial.
+///
+/// `pixels` is always the composed view. While raw mode is active, dial
+/// updates still change `pixels` but are not written, so leaving raw mode can
+/// restore the composed view.
 pub struct StripCanvas {
     mode: FullStrip,
     pixels: Mutex<RgbImage>,
+    raw: AtomicBool,
+    raw_announced: AtomicBool,
 }
 
 impl StripCanvas {
-    fn new(mode: FullStrip) -> Self {
+    pub fn new(mode: FullStrip) -> Self {
         let (width, height) = FULL_STRIP_FORMAT.size;
         Self {
             mode,
             pixels: Mutex::new(RgbImage::new(width as u32, height as u32)),
+            raw: AtomicBool::new(false),
+            raw_announced: AtomicBool::new(false),
         }
+    }
+
+    /// The transport the strip is written through.
+    pub fn mode(&self) -> FullStrip {
+        self.mode
+    }
+
+    /// Whether the strip currently shows a raw frame.
+    pub fn is_raw(&self) -> bool {
+        self.raw.load(Ordering::SeqCst)
     }
 
     fn update(&self, dial: u8, image: Option<DynamicImage>) -> Result<DynamicImage, MirajazzError> {
@@ -354,31 +436,62 @@ impl StripCanvas {
         Ok(DynamicImage::ImageRgb8(pixels.clone()))
     }
 
-    async fn set_dial(
+    pub async fn set_dial<S: StripSink>(
         &self,
-        device: &Device,
+        sink: &S,
         dial: u8,
         image: Option<DynamicImage>,
     ) -> Result<(), MirajazzError> {
         let image = self.update(dial, image)?;
-        match self.mode {
-            FullStrip::ImageSlot(index) => {
-                device
-                    .set_button_image(index, FULL_STRIP_FORMAT, image)
-                    .await?;
-                device.flush().await
-            }
-            FullStrip::Bgpic => send_strip_bgpic(device, image).await,
+        if self.is_raw() {
+            return Ok(());
         }
+        sink.write_strip(self.mode, image).await
+    }
+
+    /// Shows `frame` 1:1 and enters raw mode once the write has succeeded.
+    pub async fn set_raw<S: StripSink>(
+        &self,
+        sink: &S,
+        frame: RgbImage,
+    ) -> Result<(), MirajazzError> {
+        sink.write_strip(self.mode, DynamicImage::ImageRgb8(frame))
+            .await?;
+        self.raw.store(true, Ordering::SeqCst);
+        if !self.raw_announced.swap(true, Ordering::SeqCst) {
+            let transport = match self.mode {
+                FullStrip::ImageSlot(_) => "image slot",
+                FullStrip::Bgpic => "BGPIC",
+            };
+            log::info!("Raw 800x128 strip active via {transport}");
+        }
+        Ok(())
+    }
+
+    /// Blanks the composed view and leaves raw mode. Returns the blank strip
+    /// when the transport needs it written explicitly (BGPIC).
+    fn blank(&self) -> Option<DynamicImage> {
+        let mut pixels = self.pixels.lock().unwrap();
+        pixels.fill(0);
+        self.raw.store(false, Ordering::SeqCst);
+        (self.mode == FullStrip::Bgpic).then(|| DynamicImage::ImageRgb8(pixels.clone()))
+    }
+
+    /// Leaves raw mode and shows the composed view again. Does nothing when
+    /// raw mode is not active.
+    pub async fn clear_raw<S: StripSink>(&self, sink: &S) -> Result<(), MirajazzError> {
+        if !self.is_raw() {
+            return Ok(());
+        }
+        let composed = DynamicImage::ImageRgb8(self.pixels.lock().unwrap().clone());
+        sink.write_strip(self.mode, composed).await?;
+        self.raw.store(false, Ordering::SeqCst);
+        Ok(())
     }
 }
 
 async fn clear_display(device: &Device, strip: Option<&StripCanvas>) -> Result<(), MirajazzError> {
-    let background = strip.and_then(|strip| {
-        let mut pixels = strip.pixels.lock().unwrap();
-        pixels.fill(0);
-        (strip.mode == FullStrip::Bgpic).then(|| DynamicImage::ImageRgb8(pixels.clone()))
-    });
+    let background = strip.and_then(StripCanvas::blank);
     device.clear_all_button_images().await?;
     if let Some(background) = background {
         return send_strip_bgpic(device, background).await;
@@ -439,9 +552,146 @@ fn fit_into(image: DynamicImage, size: (usize, usize)) -> DynamicImage {
 }
 
 #[cfg(test)]
+pub(crate) mod test_sink {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use image::{DynamicImage, RgbImage};
+    use mirajazz::error::MirajazzError;
+
+    use super::{FullStrip, StripSink};
+
+    /// Records every strip write instead of talking to a device.
+    #[derive(Default)]
+    pub(crate) struct RecordingSink {
+        pub writes: Mutex<Vec<RgbImage>>,
+        pub fail: AtomicBool,
+    }
+
+    impl StripSink for RecordingSink {
+        async fn write_strip(
+            &self,
+            _mode: FullStrip,
+            image: DynamicImage,
+        ) -> Result<(), MirajazzError> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(MirajazzError::BadData);
+            }
+            self.writes.lock().unwrap().push(image.into_rgb8());
+            Ok(())
+        }
+    }
+
+    impl RecordingSink {
+        pub(crate) fn count(&self) -> usize {
+            self.writes.lock().unwrap().len()
+        }
+
+        pub(crate) fn last(&self) -> RgbImage {
+            self.writes.lock().unwrap().last().cloned().unwrap()
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use super::test_sink::RecordingSink;
     use super::*;
     use image::Rgb;
+
+    fn solid(width: u32, height: u32, color: [u8; 3]) -> RgbImage {
+        RgbImage::from_pixel(width, height, Rgb(color))
+    }
+
+    #[tokio::test]
+    async fn dial_updates_during_raw_mode_update_canvas_without_writing() {
+        let sink = RecordingSink::default();
+        let strip = StripCanvas::new(FullStrip::ImageSlot(3));
+        let red = DynamicImage::ImageRgb8(solid(200, 100, [255, 0, 0]));
+        let blue = DynamicImage::ImageRgb8(solid(200, 100, [0, 0, 255]));
+
+        strip.set_dial(&sink, 0, Some(red)).await.unwrap();
+        strip
+            .set_raw(&sink, solid(800, 128, [0, 255, 0]))
+            .await
+            .unwrap();
+        assert!(strip.is_raw());
+        assert_eq!(sink.count(), 2);
+        assert_eq!(sink.last(), solid(800, 128, [0, 255, 0]));
+
+        strip.set_dial(&sink, 1, Some(blue)).await.unwrap();
+        assert_eq!(sink.count(), 2, "dial updates must not touch a raw strip");
+
+        strip.clear_raw(&sink).await.unwrap();
+        assert!(!strip.is_raw());
+        assert_eq!(sink.count(), 3);
+        let composed = sink.last();
+        assert_eq!(composed.get_pixel(100, 64), &Rgb([255, 0, 0]));
+        assert_eq!(composed.get_pixel(300, 64), &Rgb([0, 0, 255]));
+        assert_eq!(composed.get_pixel(300, 5), &Rgb([0, 0, 0]));
+    }
+
+    #[tokio::test]
+    async fn clear_raw_without_dial_images_blanks_the_strip() {
+        let sink = RecordingSink::default();
+        let strip = StripCanvas::new(FullStrip::Bgpic);
+        strip
+            .set_raw(&sink, solid(800, 128, [9, 9, 9]))
+            .await
+            .unwrap();
+        strip.clear_raw(&sink).await.unwrap();
+        assert_eq!(sink.last(), solid(800, 128, [0, 0, 0]));
+    }
+
+    #[tokio::test]
+    async fn clear_raw_when_inactive_writes_nothing() {
+        let sink = RecordingSink::default();
+        let strip = StripCanvas::new(FullStrip::ImageSlot(3));
+        strip.clear_raw(&sink).await.unwrap();
+        assert_eq!(sink.count(), 0);
+        assert!(!strip.is_raw());
+    }
+
+    #[tokio::test]
+    async fn failed_write_does_not_start_raw_mode_but_keeps_it_once_started() {
+        let sink = RecordingSink::default();
+        let strip = StripCanvas::new(FullStrip::ImageSlot(3));
+        sink.fail.store(true, Ordering::SeqCst);
+        assert!(
+            strip
+                .set_raw(&sink, solid(800, 128, [1, 2, 3]))
+                .await
+                .is_err()
+        );
+        assert!(!strip.is_raw());
+
+        sink.fail.store(false, Ordering::SeqCst);
+        strip
+            .set_raw(&sink, solid(800, 128, [1, 2, 3]))
+            .await
+            .unwrap();
+        sink.fail.store(true, Ordering::SeqCst);
+        assert!(
+            strip
+                .set_raw(&sink, solid(800, 128, [4, 5, 6]))
+                .await
+                .is_err()
+        );
+        assert!(strip.is_raw());
+    }
+
+    #[test]
+    fn blanking_the_device_ends_raw_mode() {
+        let strip = StripCanvas::new(FullStrip::ImageSlot(3));
+        strip.raw.store(true, Ordering::SeqCst);
+        assert!(strip.blank().is_none());
+        assert!(!strip.is_raw());
+
+        let strip = StripCanvas::new(FullStrip::Bgpic);
+        strip.raw.store(true, Ordering::SeqCst);
+        assert!(strip.blank().is_some());
+        assert!(!strip.is_raw());
+    }
 
     #[test]
     fn full_strip_preserves_the_whole_dial_image() {

@@ -52,6 +52,10 @@ Create `~/.config/opendeck-akp05/config.toml`.
 # See "Report a compatibility test" below for how to find them.
 # bgpic = true
 
+# Accept raw 800x128 touch-strip frames on a local socket (Unix only).
+# See "Raw strip frames" below.
+# strip_raw = true
+
 # N4 Pro-family only. Omit to leave the device's current setting alone.
 vibration = false
 
@@ -104,6 +108,23 @@ The plugin enables the full-width strip when it can read a firmware version that
 | Streonor S10 Pro | `1500:3007` | `02.017` | `BAT` wire slot 5 |
 
 Set `bgpic = true` at the top level of `config.toml` to try the experimental `BGPIC` renderer on any deck recognized by the plugin. Restart OpenDeck or reconnect the deck to apply the setting. Set `bgpic = false` or omit it to use image slots.
+
+#### Raw strip frames
+
+OpenDeck renders every dial image on a fixed 200x100 canvas, so a caller cannot send a full 800x128 picture through it. With `strip_raw = true` (top level of `config.toml`, applied when the deck connects) and a full-width transport available, the plugin instead listens on a per-device Unix socket:
+
+```
+$XDG_RUNTIME_DIR/opendeck-akp05/<device-id>.sock
+```
+
+The directory is mode `0700` and the socket `0600`. Each message is a type byte, a 32-bit big-endian payload length and the payload:
+
+| Type | Meaning | Payload |
+| --- | --- | --- |
+| `0x01` | Show a frame | One 800x128 PNG (8-bit RGB/RGBA) or RGB JPEG, at most 512 KiB, upright |
+| `0x02` | Clear | Empty; returns to the composed dial view |
+
+Every message gets one reply byte: `0x00` ok, `0x01` malformed, `0x02` unsupported encoding or colour model, `0x03` wrong size, `0x04` payload too large (the connection is then closed), `0x05` write error or deck asleep, `0x06` unknown type. While a raw frame is shown, dial images from OpenDeck are stored but do not change the strip. Reconnecting the deck, or waking it from suspend, ends raw mode.
 
 #### Report a compatibility test
 

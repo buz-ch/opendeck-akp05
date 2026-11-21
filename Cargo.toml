@@ -13,6 +13,7 @@ futures-lite = "2.6.1"
 image = { version = "0.25.10", default-features = false, features = [
   "bmp",
   "jpeg",
+  "png",
 ] }
 log = "0.4.34"
 mirajazz = { git = "https://github.com/ambiso/mirajazz.git", rev = "a5eb817033fbc0d63902db68f107535cb2ab81cd" }
